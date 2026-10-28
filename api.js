@@ -16,14 +16,10 @@ app.get('/', (req, res) => res.json({ status: 'ok', queue: queue.length }))
 
 app.post('/api/queue', async (req, res) => {
 	const { orderId, cacheKey, prompt } = req.body
-
-	if (!orderId || !cacheKey || !prompt) {
-		return res.status(400).json({ error: 'Missing fields' })
-	}
+	if (!orderId || !cacheKey || !prompt) return res.status(400).json({ error: 'Missing fields' })
 
 	queue.push({ orderId, cacheKey, prompt })
 	processQueue()
-
 	res.json({ status: 'queued', position: queue.length })
 })
 
@@ -35,9 +31,7 @@ async function processQueue() {
 
 	try {
 		console.log(`⏳ Генерация для заказа ${job.orderId}...`)
-
-		// Ждем 60 секунд (обход лимита Groq)
-		await new Promise(r => setTimeout(r, 60000))
+		await new Promise(r => setTimeout(r, 60000)) // Ждем минуту (лимит Groq)
 
 		const response = await fetch('https://api.groq.com/openai/v1/chat/completions', {
 			method: 'POST',
@@ -54,44 +48,32 @@ async function processQueue() {
 			}),
 		})
 
-		// 🔥 Проверяем, вернул ли Groq ошибку (401, 429 и т.д.)
 		if (!response.ok) {
 			const errorData = await response.text()
-			console.error('❌ Ошибка Groq:', response.status, errorData)
-			throw new Error(`Groq API вернул ${response.status}`)
+			throw new Error(`Groq API вернул ${response.status}: ${errorData}`)
 		}
 
 		const data = await response.json()
-
-		// 🔥 Проверяем, есть ли вообще ответ
 		if (!data.choices || !data.choices[0] || !data.choices[0].message) {
-			console.error('❌ Странный ответ от Groq:', JSON.stringify(data))
-			throw new Error('Groq вернул пустой ответ')
+			throw new Error('Groq вернул пустой ответ (нет message)')
 		}
 
 		let content = data.choices[0].message.content
-		if (!content) {
-			throw new Error('В ответе Groq нет текста (content)')
-		}
+		if (!content) throw new Error('В ответе Groq нет текста (content)')
 
-		// Очищаем от markdown
 		content = content
 			.replace(/^```json\s*/i, '')
 			.replace(/```\s*$/i, '')
 			.trim()
+		const tourData = JSON.parse(content)
 
-		let tourData
-		try {
-			tourData = JSON.parse(content)
-		} catch (parseError) {
-			console.error('❌ Ошибка парсинга JSON:', content.slice(0, 200))
-			throw new Error('Нейросеть вернула невалидный JSON')
+		// 🔥 Проверка: есть ли вообще остановки в ответе?
+		if (!tourData.stops || tourData.stops.length === 0) {
+			throw new Error('Нейросеть вернула JSON, но в нём нет остановок (stops)')
 		}
 
-		console.log(`✅ Заказ ${job.orderId} успешно сгенерирован.`)
-
-		// Сохраняем в Supabase
-		const saveRes = await fetch(`${supabaseUrl}/rest/v1/tour_cache`, {
+		// 🔥 1. Сохраняем в КЭШ (чтобы при повторном заказе выдать мгновенно)
+		await fetch(`${supabaseUrl}/rest/v1/tour_cache`, {
 			method: 'POST',
 			headers: {
 				apikey: supabaseKey,
@@ -102,9 +84,28 @@ async function processQueue() {
 			body: JSON.stringify({ cache_key: job.cacheKey, tour_data: tourData }),
 		})
 
-		if (!saveRes.ok) {
-			console.error('❌ Ошибка сохранения в Supabase:', await saveRes.text())
-		}
+		// 🔥 2. Сохраняем в БАЗУ МАРШРУТОВ (чтобы он появился в Лаборатории и Админке)
+		// Для этого нам нужен массив ID мест. Мы достаем его из ключа кэша.
+		const parts = job.cacheKey.split('_')
+		const selectedIdsStr = parts[2] // Ключ имеет вид "тема_кол-во_id1,id2"
+		const routeIds = selectedIdsStr ? selectedIdsStr.split(',') : []
+
+		await fetch(`${supabaseUrl}/rest/v1/tour_proposals`, {
+			method: 'POST',
+			headers: {
+				apikey: supabaseKey,
+				Authorization: `Bearer ${supabaseKey}`,
+				'Content-Type': 'application/json',
+				Prefer: 'return=minimal',
+			},
+			body: JSON.stringify({
+				title: tourData.title || 'Сгенерированный маршрут',
+				description: tourData.intro || 'Маршрут, сгенерированный нейросетью.',
+				route_ids: routeIds,
+				status: 'approved', // Сразу одобряем, чтобы он попал в поиск
+				author_id: null, // Автор - нейросеть
+			}),
+		})
 
 		// Обновляем статус заказа на "done"
 		await fetch(`${supabaseUrl}/rest/v1/tour_orders?id=eq.${job.orderId}`, {
@@ -116,9 +117,11 @@ async function processQueue() {
 			},
 			body: JSON.stringify({ status: 'done' }),
 		})
+
+		console.log(`✅ Заказ ${job.orderId} выполнен и сохранен!`)
 	} catch (e) {
 		console.error('❌ Ошибка в очереди:', e.message)
-		// Если упало, помечаем заказ как "error", чтобы фронт не висел вечно
+		// Помечаем заказ как "error", чтобы фронт не висел
 		try {
 			await fetch(`${supabaseUrl}/rest/v1/tour_orders?id=eq.${job.orderId}`, {
 				method: 'PATCH',
@@ -133,7 +136,6 @@ async function processQueue() {
 	}
 
 	isProcessing = false
-	// Запускаем следующий в очереди через 2 секунды
 	setTimeout(processQueue, 2000)
 }
 
