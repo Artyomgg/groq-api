@@ -5,12 +5,10 @@ const app = express()
 app.use(cors())
 app.use(express.json())
 
-// На Render переменные берутся из панели Environment Variables
 const GROQ_KEY = process.env.GROQ_API_KEY
 const supabaseUrl = process.env.SUPABASE_URL
 const supabaseKey = process.env.SUPABASE_SERVICE_KEY
 
-// Очередь на сервере
 let queue = []
 let isProcessing = false
 
@@ -36,7 +34,7 @@ async function processQueue() {
 	const job = queue.shift()
 
 	try {
-		console.log(`Генерация для заказа ${job.orderId}...`)
+		console.log(`⏳ Генерация для заказа ${job.orderId}...`)
 
 		// Ждем 60 секунд (обход лимита Groq)
 		await new Promise(r => setTimeout(r, 60000))
@@ -56,16 +54,44 @@ async function processQueue() {
 			}),
 		})
 
+		// 🔥 Проверяем, вернул ли Groq ошибку (401, 429 и т.д.)
+		if (!response.ok) {
+			const errorData = await response.text()
+			console.error('❌ Ошибка Groq:', response.status, errorData)
+			throw new Error(`Groq API вернул ${response.status}`)
+		}
+
 		const data = await response.json()
-		let content = data.choices?.[0]?.message?.content
+
+		// 🔥 Проверяем, есть ли вообще ответ
+		if (!data.choices || !data.choices[0] || !data.choices[0].message) {
+			console.error('❌ Странный ответ от Groq:', JSON.stringify(data))
+			throw new Error('Groq вернул пустой ответ')
+		}
+
+		let content = data.choices[0].message.content
+		if (!content) {
+			throw new Error('В ответе Groq нет текста (content)')
+		}
+
+		// Очищаем от markdown
 		content = content
 			.replace(/^```json\s*/i, '')
 			.replace(/```\s*$/i, '')
 			.trim()
-		const tourData = JSON.parse(content)
+
+		let tourData
+		try {
+			tourData = JSON.parse(content)
+		} catch (parseError) {
+			console.error('❌ Ошибка парсинга JSON:', content.slice(0, 200))
+			throw new Error('Нейросеть вернула невалидный JSON')
+		}
+
+		console.log(`✅ Заказ ${job.orderId} успешно сгенерирован.`)
 
 		// Сохраняем в Supabase
-		await fetch(`${supabaseUrl}/rest/v1/tour_cache`, {
+		const saveRes = await fetch(`${supabaseUrl}/rest/v1/tour_cache`, {
 			method: 'POST',
 			headers: {
 				apikey: supabaseKey,
@@ -76,7 +102,11 @@ async function processQueue() {
 			body: JSON.stringify({ cache_key: job.cacheKey, tour_data: tourData }),
 		})
 
-		// Обновляем статус заказа
+		if (!saveRes.ok) {
+			console.error('❌ Ошибка сохранения в Supabase:', await saveRes.text())
+		}
+
+		// Обновляем статус заказа на "done"
 		await fetch(`${supabaseUrl}/rest/v1/tour_orders?id=eq.${job.orderId}`, {
 			method: 'PATCH',
 			headers: {
@@ -86,10 +116,9 @@ async function processQueue() {
 			},
 			body: JSON.stringify({ status: 'done' }),
 		})
-
-		console.log(`✅ Заказ ${job.orderId} выполнен!`)
 	} catch (e) {
-		console.error('Ошибка генерации:', e)
+		console.error('❌ Ошибка в очереди:', e.message)
+		// Если упало, помечаем заказ как "error", чтобы фронт не висел вечно
 		try {
 			await fetch(`${supabaseUrl}/rest/v1/tour_orders?id=eq.${job.orderId}`, {
 				method: 'PATCH',
@@ -104,7 +133,8 @@ async function processQueue() {
 	}
 
 	isProcessing = false
-	processQueue()
+	// Запускаем следующий в очереди через 2 секунды
+	setTimeout(processQueue, 2000)
 }
 
 const PORT = process.env.PORT || 3001
